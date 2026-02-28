@@ -1,6 +1,6 @@
 '''
-V2 "Fold Master" Pokerbot for Sneak Peek Hold'em.
-Features: True Bayesian Updating, O(1) Bitwise Evaluator, Decoupled Auction, and Range Balancing.
+V3 "Fold Master" Pokerbot for Sneak Peek Hold'em.
+Features: Rational-Capped Auction, Polarized MC Rollouts, Board Texture Rejection, and Capped Range Exploitation.
 '''
 from pkbot.actions import ActionFold, ActionCall, ActionCheck, ActionRaise, ActionBid
 from pkbot.states import GameInfo, PokerState
@@ -11,16 +11,20 @@ import random
 
 class Player(BaseBot):
     def __init__(self) -> None:
-        '''Called exactly once when a new game starts.'''
         self.rank_map = {'2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, 'T': 10, 'J': 11, 'Q': 12, 'K': 13, 'A': 14}
-        self.bit_shifts = {'2': 0, '3': 1, '4': 2, '5': 3, '6': 4, '7': 5, '8': 6, '9': 7, 'T': 8, 'J': 9, 'Q': 10, 'K': 11, 'A': 12}
+        self.full_deck = [r+s for r in '23456789TJQKA' for s in 'hdcs']
 
-        # Tracking variables for Opponent Profiling
+        # Engine Trackers
         self.hands_played = 0
         self.opp_vpip_count = 0
-        self.opp_aggression_factor = 0.0
+        self.opp_vpip = 0.50
 
-        # EXACT HEADS-UP PRE-FLOP EQUITIES (169 Hands)
+        # Dynamic Auction Market Trackers
+        self.pre_auction_pot = 0
+        self.auction_history_pct = []
+        self.opp_avg_bid_pct = 0.10 # Assume a rational 10% pot baseline for the field
+
+        # EXACT HEADS-UP PRE-FLOP EQUITIES (O(1) Lookup)
         self.preflop_equities = {
             'AA': 0.853, 'KK': 0.824, 'QQ': 0.799, 'JJ': 0.775, 'TT': 0.751,
             '99': 0.721, '88': 0.691, '77': 0.662, '66': 0.633, '55': 0.603,
@@ -69,206 +73,249 @@ class Player(BaseBot):
             '32o': 0.312
         }
 
+        # Build percentiles for range filtering
+        sorted_hands = sorted(self.preflop_equities.values(), reverse=True)
+        self.equity_percentiles = {
+            p / 100.0: sorted_hands[int((len(sorted_hands)-1) * (p / 100.0))]
+            for p in range(5, 105, 5)
+        }
+
     def on_hand_start(self, game_info: GameInfo, current_state: PokerState) -> None:
         self.hands_played += 1
+        self.pre_auction_pot = 0
 
     def on_hand_end(self, game_info: GameInfo, current_state: PokerState) -> None:
         pass
 
     def _get_hand_key(self, hand) -> str:
-        rank_order = '23456789TJQKA'
         r1, r2 = hand[0][0], hand[1][0]
         s1, s2 = hand[0][1], hand[1][1]
-        if rank_order.index(r1) < rank_order.index(r2):
-            r1, r2 = r2, r1
+        if self.rank_map[r1] < self.rank_map[r2]: r1, r2 = r2, r1
         if r1 == r2: return r1 + r2
         elif s1 == s2: return r1 + r2 + 's'
-        else: return r1 + r2 + 'o'
+        return r1 + r2 + 'o'
 
-    def _estimate_equity(self, my_hand, board, street, opp_revealed) -> float:
-        '''O(1) True Bayesian Bitwise Evaluator'''
-        if not board:
-            hand_key = self._get_hand_key(my_hand)
-            return self.preflop_equities.get(hand_key, 0.500)
+    def _get_hand_rank(self, cards) -> tuple:
+        '''O(1) Exact Tuple Evaluator for Showdown Logic'''
+        ranks = sorted([self.rank_map[c[0]] for c in cards], reverse=True)
+        suits = [c[1] for c in cards]
 
-        master_mask = 0
-        suit_masks = {'h': 0, 'd': 0, 'c': 0, 's': 0}
+        suit_counts = {}
+        for s in suits: suit_counts[s] = suit_counts.get(s, 0) + 1
+        flush_suit = next((s for s, c in suit_counts.items() if c >= 5), None)
+
+        flush_cards = []
+        if flush_suit:
+            flush_cards = sorted([self.rank_map[c[0]] for c in cards if c[1] == flush_suit], reverse=True)
+
         rank_counts = {}
-        all_cards = my_hand + board
+        for r in ranks: rank_counts[r] = rank_counts.get(r, 0) + 1
+        freq_sorted = sorted(rank_counts.items(), key=lambda x: (x[1], x[0]), reverse=True)
 
-        for card in all_cards:
-            r, s = card[0], card[1]
-            shift = self.bit_shifts[r]
+        def get_straight_high(r_list):
+            unique_r = sorted(list(set(r_list)), reverse=True)
+            if 14 in unique_r: unique_r.append(1)
+            consec = 1
+            for i in range(len(unique_r) - 1):
+                if unique_r[i] == unique_r[i+1] + 1:
+                    consec += 1
+                    if consec == 5: return unique_r[i-3]
+                else: consec = 1
+            return None
 
-            master_mask |= (1 << shift)
-            suit_masks[s] |= (1 << shift)
-            rank_counts[r] = rank_counts.get(r, 0) + 1
+        if flush_cards:
+            sf_high = get_straight_high(flush_cards)
+            if sf_high: return (8, sf_high)
+        if freq_sorted[0][1] == 4:
+            kicker = max([r for r in ranks if r != freq_sorted[0][0]])
+            return (7, freq_sorted[0][0], kicker)
+        if freq_sorted[0][1] == 3 and len(freq_sorted) > 1 and freq_sorted[1][1] >= 2:
+            return (6, freq_sorted[0][0], freq_sorted[1][0])
+        if flush_cards: return tuple([5] + flush_cards[:5])
 
-        max_suit_count = max(bin(mask).count('1') for mask in suit_masks.values())
-        max_kind = max(rank_counts.values()) if rank_counts else 1
+        st_high = get_straight_high(ranks)
+        if st_high: return (4, st_high)
 
-        is_straight = False
-        straight_draw = False
+        if freq_sorted[0][1] == 3:
+            kickers = sorted([r for r in ranks if r != freq_sorted[0][0]], reverse=True)[:2]
+            return tuple([3, freq_sorted[0][0]] + kickers)
+        if freq_sorted[0][1] == 2 and len(freq_sorted) > 1 and freq_sorted[1][1] >= 2:
+            kicker = max([r for r in ranks if r != freq_sorted[0][0] and r != freq_sorted[1][0]])
+            return (2, freq_sorted[0][0], freq_sorted[1][0], kicker)
+        if freq_sorted[0][1] == 2:
+            kickers = sorted([r for r in ranks if r != freq_sorted[0][0]], reverse=True)[:3]
+            return tuple([1, freq_sorted[0][0]] + kickers)
+        return tuple([0] + ranks[:5])
 
-        if (master_mask & (master_mask >> 1) & (master_mask >> 2) & (master_mask >> 3) & (master_mask >> 4)):
-            is_straight = True
-        elif (master_mask & 0x100F) == 0x100F: # Wheel straight
-            is_straight = True
-        elif (master_mask & (master_mask >> 1) & (master_mask >> 2) & (master_mask >> 3)):
-            straight_draw = True
+    def _monte_carlo_rollout(self, my_hand, board, opp_vpip, opp_revealed, bet_ratio, is_capped) -> float:
+        '''Range-Weighted, Board-Aware, and Action-Polarized Monte Carlo'''
+        if not board: return self.preflop_equities.get(self._get_hand_key(my_hand), 0.500)
 
-        is_boat = False
-        if max_kind == 3:
-            pairs = sum(1 for count in rank_counts.values() if count >= 2)
-            if pairs >= 2:
-                is_boat = True
+        # Base Threshold
+        vpip_percentile = max(5, 5 * round(min(max(int(opp_vpip * 100), 5), 100) / 5))
+        vpip_eq = self.equity_percentiles[vpip_percentile / 100.0]
 
-        # Made Hands Base Equity
-        if is_boat: equity = 0.95
-        elif max_suit_count >= 5: equity = 0.90
-        elif is_straight: equity = 0.85
-        elif max_kind == 3: equity = 0.75
-        else:
-            equity = 0.20
-            pairs = sum(1 for count in rank_counts.values() if count == 2)
-            if pairs >= 2 and max_kind < 3:
-                hole_r1, hole_r2 = my_hand[0][0], my_hand[1][0]
-                if rank_counts.get(hole_r1) == 2 or rank_counts.get(hole_r2) == 2:
-                    equity = 0.65
-                else:
-                    equity = 0.40
-            elif max_kind == 2:
-                hole_r1, hole_r2 = my_hand[0][0], my_hand[1][0]
-                if rank_counts.get(hole_r1) == 2 or rank_counts.get(hole_r2) == 2:
-                    equity = 0.55
-                else:
-                    equity = 0.35
+        # Polarization Dynamics
+        is_polarized = bet_ratio > 0.75
+        top_15_eq = self.equity_percentiles[0.15]
+        bottom_30_eq = self.equity_percentiles[0.70]
+        top_25_eq = self.equity_percentiles[0.25]
 
-        # Base Draw Outs
-        outs = 0
-        flush_suit = None
-        if max_suit_count == 4:
-            outs += 9
-            for s, mask in suit_masks.items():
-                if bin(mask).count('1') >= 4:
-                    flush_suit = s
-                    break
-        if straight_draw:
-            outs += 8
+        # Board Texture (Bayesian Rejection Proxy)
+        board_suits = [c[1] for c in board]
+        suit_counts = {s: board_suits.count(s) for s in set(board_suits)}
+        flush_threat_suit = next((s for s, count in suit_counts.items() if count >= 3), None)
 
-        # ==========================================
-        # BAYESIAN UPDATING (Fixing Weakness #8)
-        # ==========================================
-        if opp_revealed:
-            for card in opp_revealed:
-                rev_r, rev_s = card[0], card[1]
+        dead_cards = set(my_hand + board)
+        if opp_revealed: dead_cards.update(opp_revealed)
+        available_deck = [c for c in self.full_deck if c not in dead_cards]
 
-                # If they paired the board, we cap our equity (unless we hold a monster)
-                if rank_counts.get(rev_r, 0) > 0 and not (is_boat or max_suit_count >= 5 or is_straight):
-                    equity = min(equity, 0.40)
+        wins, samples = 0, 0
+        target_samples = 250
 
-                # If they hold a card of our flush suit, we literally have 1 less out!
-                if flush_suit and rev_s == flush_suit:
-                    outs = max(0, outs - 1)
+        for _ in range(target_samples * 5):
+            if samples >= target_samples: break
 
-        # Draw Calculations (Rule of 4 and 2 applied to Bayesian-adjusted outs)
-        if not (is_boat or max_suit_count >= 5 or is_straight) and outs > 0:
-            multiplier = 4.0 if street == 'flop' else 2.0
-            draw_equity = min(0.50, (outs * multiplier) / 100.0)
-            equity = max(equity, draw_equity)
+            if opp_revealed: opp_hand = [opp_revealed[0], random.choice(available_deck)]
+            else: opp_hand = random.sample(available_deck, 2)
 
-        return equity
+            opp_key = self._get_hand_key(opp_hand)
+            preflop_eq = self.preflop_equities.get(opp_key, 0.5)
+
+            # Action-Conditioned Range Filtering
+            if is_polarized:
+                # If they overbet, they represent the nuts OR air. Reject medium hands.
+                if not (preflop_eq >= top_15_eq or preflop_eq <= bottom_30_eq): continue
+            elif is_capped:
+                # If they checked/bet tiny, they don't have the nuts. Reject top hands.
+                if preflop_eq >= top_25_eq: continue
+            else:
+                if preflop_eq < vpip_eq: continue
+
+            # Board-Aware Weighting
+            if flush_threat_suit:
+                has_threat_suit = opp_hand[0][1] == flush_threat_suit or opp_hand[1][1] == flush_threat_suit
+                if not has_threat_suit and random.random() < 0.40: continue
+
+            cards_needed = 5 - len(board)
+            if cards_needed > 0:
+                temp_deck = [c for c in available_deck if c not in opp_hand]
+                sim_board = board + random.sample(temp_deck, cards_needed)
+            else: sim_board = board
+
+            my_rank = self._get_hand_rank(my_hand + sim_board)
+            opp_rank = self._get_hand_rank(opp_hand + sim_board)
+
+            if my_rank > opp_rank: wins += 1
+            elif my_rank == opp_rank: wins += 0.5
+            samples += 1
+
+        if samples == 0: return 0.5
+        return wins / samples
 
     def get_move(self, game_info: GameInfo, current_state: PokerState) -> ActionFold | ActionCall | ActionCheck | ActionRaise | ActionBid:
         street = current_state.street
-
-        # Pass the revealed cards directly into the evaluator
-        equity = self._estimate_equity(current_state.my_hand, current_state.board, street, current_state.opp_revealed_cards)
-
-        # Track Aggression (VPIP)
-        if current_state.opp_wager > 20:
-            self.opp_vpip_count += 1
-        if self.hands_played > 10:
-            self.opp_aggression_factor = self.opp_vpip_count / self.hands_played
-
-        # Positional Advantage
-        if (street == 'preflop' and current_state.is_bb) or (street != 'preflop' and not current_state.is_bb):
-            equity *= 1.05
-
-        # Range Penalties
-        if current_state.opp_wager > 20 and not current_state.board:
-            equity *= 0.85
-
-        # ==========================================
-        # AUCTION PHASE: Decoupled Mixed Strategy
-        # ==========================================
-        if street == 'auction':
-            pot = current_state.pot
-            min_tax = random.randint(20, 60) # Information Tax (Never bid 0)
-
-            if equity < 0.45:
-                # 20% bluff bid to destroy their categorization logic
-                if random.random() < 0.20:
-                    bid_amt = int(pot * random.uniform(0.20, 0.40))
-                else:
-                    bid_amt = min_tax
-                return ActionBid(min(bid_amt, current_state.my_chips))
-
-            elif 0.45 <= equity < 0.70:
-                # FIX: Ensure lower bound is always <= upper bound
-                lower_bound = min_tax + 5
-                upper_bound = max(lower_bound + 5, int(pot * 0.25))
-                bid_amt = random.randint(lower_bound, upper_bound)
-                return ActionBid(min(bid_amt, current_state.my_chips))
-
-            else:
-                # 30% of the time, disguise a monster with a tiny minimum tax bid
-                if random.random() < 0.30:
-                    bid_amt = min_tax
-                else:
-                    bid_amt = int(pot * random.uniform(0.15, 0.35))
-                return ActionBid(min(bid_amt, current_state.my_chips))
-
-        # ==========================================
-        # BETTING PHASE: Exploitative Sizing
-        # ==========================================
         pot = current_state.pot
         cost = current_state.cost_to_call
+        my_chips = current_state.my_chips
+
+        # --------------------------------------------------
+        # TRACKING: VPIP and Rational Market Pricing
+        # --------------------------------------------------
+        if street == 'preflop' and current_state.opp_wager > 20:
+            self.opp_vpip_count += 1
+        if self.hands_played > 10:
+            self.opp_vpip = self.opp_vpip_count / self.hands_played
+
+        # Track the actual cost of information paid into the pot
+        if self.pre_auction_pot > 0 and street != 'auction':
+            paid_into_pot = pot - self.pre_auction_pot
+            if paid_into_pot > 0:
+                pct_paid = paid_into_pot / self.pre_auction_pot
+                self.auction_history_pct.append(pct_paid)
+                recent = self.auction_history_pct[-15:]
+                self.opp_avg_bid_pct = sum(recent) / len(recent)
+            self.pre_auction_pot = 0
+
+        bet_ratio = cost / pot if pot > 0 else 0
+
+        is_capped = False
+        if street in ['turn', 'river'] and bet_ratio < 0.25:
+            is_capped = True
+
+        equity = self._monte_carlo_rollout(
+            current_state.my_hand,
+            current_state.board,
+            self.opp_vpip,
+            current_state.opp_revealed_cards,
+            bet_ratio,
+            is_capped
+        )
+
         required_equity = cost / (pot + cost) if (pot + cost) > 0 else 0.0
 
-        # Adjust for Bully Opponents
-        if self.opp_aggression_factor > 0.40:
-            required_equity *= 0.80
+        # Dynamic Confidence Buffer
+        buffer = 0.06 if street == 'flop' else 0.04 if street == 'turn' else 0.02
+        safe_equity = equity - buffer
 
-        # The Bluff Catcher (Hero Call)
-        if cost > pot and 0.55 <= equity < 0.70:
-            if random.random() < 0.30 and current_state.can_act(ActionCall):
-                return ActionCall()
+        # --------------------------------------------------
+        # V17 AUCTION: Rational Field GTO Logic
+        # --------------------------------------------------
+        if street == 'auction':
+            self.pre_auction_pot = pot
 
-        # The Balanced Bluff & Value Raise
+            # Start at a 10% baseline, flex up to 18% if opponent fights rationally.
+            base_pct = max(0.10, min(0.18, self.opp_avg_bid_pct + 0.02))
+
+            # Flattened Quadratic Uncertainty: Info is most valuable at 0.50 equity.
+            distance = abs(equity - 0.50) / 0.50
+            uncertainty = max(0.0, 1.0 - (distance ** 2))
+
+            # Leverage Multiplier
+            leverage = min(1.2, (my_chips / pot) / 10.0) if pot > 0 else 1.0
+
+            # Formulate Bids
+            bid = pot * base_pct * uncertainty * leverage
+            bid *= random.uniform(0.9, 1.1)
+
+            # THE RATIONALITY CAP: Never pay more than 20% of the pot for 1 card.
+            # This crushes maniacs by letting them overpay, while dominating GTO bots in the 10-18% range.
+            bid = min(bid, pot * 0.20)
+            bid = min(bid, 0.20 * my_chips) # Anti-suicide safety
+
+            return ActionBid(int(bid))
+
+        # --------------------------------------------------
+        # V17 BETTING PHASE: Exploitative Action
+        # --------------------------------------------------
+        in_position = (street != 'preflop' and not current_state.is_bb)
+
         if current_state.can_act(ActionRaise):
             min_raise, max_raise = current_state.raise_bounds
 
-            # Value Raise with Jitter
-            if equity > 0.65 and equity > required_equity + 0.10:
-                target_raise = int(pot * random.uniform(0.5, 1.2)) + cost
-                if equity > 0.85 and random.random() < 0.5:
-                    target_raise = int(pot * random.uniform(1.5, 2.5)) + cost
+            # Value Raise
+            if safe_equity > 0.65 and safe_equity > required_equity + 0.10:
+                scale = 0.5 + (safe_equity - 0.65) * 2.0
+                target_raise = int(pot * random.uniform(scale - 0.1, scale + 0.1)) + cost
                 valid_raise = max(min_raise, min(target_raise, max_raise))
                 return ActionRaise(valid_raise)
 
-            # Balanced Bluff (10% on pure trash)
-            if equity < 0.40 and cost <= 20 and random.random() < 0.10:
-                target_raise = int(pot * random.uniform(0.5, 0.8))
-                valid_raise = max(min_raise, min(target_raise, max_raise))
-                return ActionRaise(valid_raise)
+            # CAPPED RANGE ATTACK (Fold Equity Injection)
+            if is_capped and in_position and cost == 0:
+                fold_freq_est = 0.60
+                test_bet = int(pot * 0.6)
+                ev_bluff = (fold_freq_est * pot) + ((1 - fold_freq_est) * (equity * (pot + test_bet*2) - test_bet))
 
-        # Standard Calling / Floating
-        if equity >= required_equity:
+                # If EV is positive, FIRE THE BLUFF exactly on the margin.
+                if ev_bluff > 0 and equity < 0.50:
+                    valid_raise = max(min_raise, min(test_bet, max_raise))
+                    return ActionRaise(valid_raise)
+
+        # Defense
+        if safe_equity >= required_equity:
             if cost == 0 and current_state.can_act(ActionCheck): return ActionCheck()
             if current_state.can_act(ActionCall): return ActionCall()
 
-        # Folding
         if current_state.can_act(ActionCheck) and cost == 0: return ActionCheck()
         if current_state.can_act(ActionFold): return ActionFold()
         return ActionCheck()
